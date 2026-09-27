@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Application layer: Cloud Map service discovery, task definitions
+  (app + X-Ray sidecar), the Orders DynamoDB table, and ECS Fargate services for
+  Auth, Orders, and Notifications. Orders uses native ECS blue/green deployments
+  (listener-rule traffic shifting between two target groups); Auth and
+  Notifications use rolling deployments with the circuit breaker enabled.
+  Requires the ECR repos (00-ecr.yaml) to already contain the images passed in.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: saa-microservices
+  AuthImage:
+    Type: String
+    Description: Full ECR image URI:tag for the Auth service
+  OrdersImage:
+    Type: String
+    Description: >
+      Full ECR image URI:tag for the Orders service. After the pipeline (04) has
+      deployed, pass the image currently running (or the stack will roll Orders back
+      to this image on the next update).
+  NotificationsImage:
+    Type: String
+    Description: Full ECR image URI:tag for the Notifications service
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Tasks per service (2 = one per AZ)
+
+Resources:
+
+  ############################
+  # Log groups
+  ############################
+  AuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}/auth"
+      RetentionInDays: 14
+
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}/orders"
+      RetentionInDays: 14
+
+  NotificationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}/notifications"
+      RetentionInDays: 14
+
+  ############################
+  # Data: Orders table (source of truth; Redis is only a read cache in front of it)
+  ############################
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-orders"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: userId, AttributeType: S}
+        - {AttributeName: orderId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: userId, KeyType: HASH}
+        - {AttributeName: orderId, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+
+  ############################
+  # IAM
+  ############################
+  # Execution role for Orders and Notifications: pull images + write logs only.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Separate execution role for Auth, so only Auth's task definition can have the
+  # JWT signing key injected at container start.
+  AuthTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-auth-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadJwtSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: "${AppName}-JwtSecretArn"
+
+  AuthTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-auth-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  OrdersTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-orders-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: OrdersTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt OrdersTable.Arn
+
+  NotificationsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-notifications-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  # Lets ECS rewrite the Orders listener-rule weights during blue/green deployments.
+  EcsBlueGreenInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-ecs-bluegreen-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers
+
+  ############################
+  # Cloud Map service discovery entries
+  # (Orders has none: nothing calls it internally; it is reached only via the ALB.)
+  ############################
+  AuthDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: auth
+      NamespaceId: !ImportValue
+        Fn::Sub: "${AppName}-NamespaceId"
+      DnsConfig:
+        DnsRecords: [{Type: A, TTL: 10}]
+      HealthCheckCustomConfig: {FailureThreshold: 1}
+
+  NotificationsDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: notifications
+      NamespaceId: !ImportValue
+        Fn::Sub: "${AppName}-NamespaceId"
+      DnsConfig:
+        DnsRecords: [{Type: A, TTL: 10}]
+      HealthCheckCustomConfig: {FailureThreshold: 1}
+
+  ############################
+  # ALB target groups + listener rules (Auth: standard; Orders: blue/green pair)
+  # Target group names are limited to 32 characters.
+  ############################
+  AuthTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-auth-tg"
+      TargetType: ip
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: "${AppName}-VpcId"
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  AuthListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: "${AppName}-HttpListenerArn"
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/auth", "/api/auth/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AuthTargetGroup
+
+  OrdersBlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-orders-blue"
+      TargetType: ip
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: "${AppName}-VpcId"
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  OrdersGreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-orders-green"
+      TargetType: ip
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: "${AppName}-VpcId"
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  # Both Orders rules forward to BOTH target groups with weights. ECS swaps the
+  # weights on each deployment; listing both groups (a) keeps the idle group
+  # attached to the ALB so it is health-checked, and (b) means CloudFormation has
+  # no reason to rewrite these rules on later stack updates, so it never fights
+  # ECS over which colour is live.
+  OrdersProdListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: "${AppName}-HttpListenerArn"
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/orders", "/api/orders/*"]
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - {TargetGroupArn: !Ref OrdersBlueTargetGroup, Weight: 100}
+              - {TargetGroupArn: !Ref OrdersGreenTargetGroup, Weight: 0}
+
+  OrdersTestListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: "${AppName}-TestListenerArn"
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/orders", "/api/orders/*"]
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - {TargetGroupArn: !Ref OrdersBlueTargetGroup, Weight: 0}
+              - {TargetGroupArn: !Ref OrdersGreenTargetGroup, Weight: 100}
+
+  ############################
+  # Task definitions (app container + X-Ray daemon sidecar)
+  ############################
+  AuthTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-auth"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt AuthTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AuthTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref AuthImage
+          Essential: true
+          PortMappings: [{ContainerPort: 3000, Protocol: tcp}]
+          Environment:
+            - {Name: PORT, Value: "3000"}
+            - {Name: SERVICE_NAME, Value: auth}
+            - {Name: AWS_XRAY_DAEMON_ADDRESS, Value: "127.0.0.1:2000"}
+          Secrets:
+            - Name: JWT_SECRET
+              ValueFrom: !Sub
+                - "${SecretArn}:secret::"
+                - SecretArn: !ImportValue
+                    Fn::Sub: "${AppName}-JwtSecretArn"
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AuthLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: auth
+        - Name: xray-daemon
+          Image: public.ecr.aws/xray/aws-xray-daemon:3.x
+          Essential: false
+          PortMappings: [{ContainerPort: 2000, Protocol: udp}]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AuthLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: xray
+
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-orders"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt OrdersTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref OrdersImage
+          Essential: true
+          PortMappings: [{ContainerPort: 3000, Protocol: tcp}]
+          Environment:
+            - {Name: PORT, Value: "3000"}
+            - {Name: SERVICE_NAME, Value: orders}
+            - {Name: AWS_XRAY_DAEMON_ADDRESS, Value: "127.0.0.1:2000"}
+            - {Name: ORDERS_TABLE, Value: !Ref OrdersTable}
+            - {Name: REDIS_HOST, Value: !ImportValue {Fn::Sub: "${AppName}-RedisEndpointAddress"}}
+            - {Name: REDIS_PORT, Value: "6379"}
+            - Name: AUTH_SERVICE_URL
+              Value: !Sub
+                - "http://auth.${Namespace}:3000"
+                - Namespace: !ImportValue {Fn::Sub: "${AppName}-NamespaceName"}
+            - Name: NOTIFICATIONS_SERVICE_URL
+              Value: !Sub
+                - "http://notifications.${Namespace}:3000"
+                - Namespace: !ImportValue {Fn::Sub: "${AppName}-NamespaceName"}
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders
+        - Name: xray-daemon
+          Image: public.ecr.aws/xray/aws-xray-daemon:3.x
+          Essential: false
+          PortMappings: [{ContainerPort: 2000, Protocol: udp}]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: xray
+
+  NotificationsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-notifications"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt NotificationsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref NotificationsImage
+          Essential: true
+          PortMappings: [{ContainerPort: 3000, Protocol: tcp}]
+          Environment:
+            - {Name: PORT, Value: "3000"}
+            - {Name: SERVICE_NAME, Value: notifications}
+            - {Name: AWS_XRAY_DAEMON_ADDRESS, Value: "127.0.0.1:2000"}
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref NotificationsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: notifications
+        - Name: xray-daemon
+          Image: public.ecr.aws/xray/aws-xray-daemon:3.x
+          Essential: false
+          PortMappings: [{ContainerPort: 2000, Protocol: udp}]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref NotificationsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: xray
+
+  ############################
+  # ECS Services
+  ############################
+  AuthService:
+    Type: AWS::ECS::Service
+    DependsOn: AuthListenerRule
+    Properties:
+      ServiceName: !Sub "${AppName}-auth"
+      Cluster: !ImportValue {Fn::Sub: "${AppName}-ClusterArn"}
+      TaskDefinition: !Ref AuthTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet1Id"}
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet2Id"}
+          SecurityGroups:
+            - !ImportValue {Fn::Sub: "${AppName}-EcsSgId"}
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 3000
+          TargetGroupArn: !Ref AuthTargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt AuthDiscoveryService.Arn
+
+  # Native ECS blue/green: a new revision is started in the idle target group,
+  # reachable on the test listener (:8080), then ECS flips the production
+  # listener-rule weights, bakes for BakeTimeInMinutes (rollback = flip back),
+  # and finally stops the old revision. Works for both CloudFormation updates
+  # and the CodePipeline ECS deploy action in 04-pipeline-orders.yaml.
+  OrdersService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AppName}-orders"
+      Cluster: !ImportValue {Fn::Sub: "${AppName}-ClusterArn"}
+      TaskDefinition: !Ref OrdersTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentController:
+        Type: ECS
+      DeploymentConfiguration:
+        Strategy: BLUE_GREEN
+        BakeTimeInMinutes: 5
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet1Id"}
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet2Id"}
+          SecurityGroups:
+            - !ImportValue {Fn::Sub: "${AppName}-EcsSgId"}
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 3000
+          TargetGroupArn: !Ref OrdersBlueTargetGroup
+          AdvancedConfiguration:
+            AlternateTargetGroupArn: !Ref OrdersGreenTargetGroup
+            ProductionListenerRule: !Ref OrdersProdListenerRule
+            TestListenerRule: !Ref OrdersTestListenerRule
+            RoleArn: !GetAtt EcsBlueGreenInfrastructureRole.Arn
+
+  NotificationsService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AppName}-notifications"
+      Cluster: !ImportValue {Fn::Sub: "${AppName}-ClusterArn"}
+      TaskDefinition: !Ref NotificationsTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet1Id"}
+            - !ImportValue {Fn::Sub: "${AppName}-PrivateSubnet2Id"}
+          SecurityGroups:
+            - !ImportValue {Fn::Sub: "${AppName}-EcsSgId"}
+      # Internal-only service: no ALB target group, reachable purely via
+      # Cloud Map DNS (notifications.internal.saa-microservices.local).
+      ServiceRegistries:
+        - RegistryArn: !GetAtt NotificationsDiscoveryService.Arn
+
+Outputs:
+  OrdersServiceName:
+    Value: !GetAtt OrdersService.Name
+    Export: {Name: !Sub "${AppName}-OrdersServiceName"}
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: {Name: !Sub "${AppName}-TaskExecutionRoleArn"}
+  OrdersTaskRoleArn:
+    Value: !GetAtt OrdersTaskRole.Arn
+    Export: {Name: !Sub "${AppName}-OrdersTaskRoleArn"}

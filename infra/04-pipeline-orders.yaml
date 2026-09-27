@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CI/CD for the Orders service: CodeCommit source, CodeBuild
+  (build image, push to ECR, emit imagedefinitions.json), and the CodePipeline
+  ECS deploy action. Because the Orders service uses the native ECS BLUE_GREEN
+  deployment strategy (03-services.yaml), each pipeline run is a blue/green
+  deployment: new revision in the idle target group, test listener on :8080,
+  production listener-rule flip, bake, then the old revision is stopped. The
+  same pattern can be duplicated for Auth/Notifications (see README).
+
+Parameters:
+  AppName:
+    Type: String
+    Default: saa-microservices
+
+Resources:
+  SourceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}-orders-src"
+      RepositoryDescription: Source for the Orders microservice
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-orders-pipeline-artifacts-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !ImportValue {Fn::Sub: "${AppName}-OrdersRepoArn"}
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppName}-orders-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}/orders"}
+          - {Name: AWS_REGION, Value: !Ref AWS::Region}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codepipeline.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketVersioning]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codecommit:GetRepository
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt SourceRepo.Arn
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: !GetAtt CodeBuildProject.Arn
+              # ECS deploy action: clones the service's current task definition with
+              # the new image, registers it, and calls UpdateService.
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:TagResource
+                  - ecs:UpdateService
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !ImportValue {Fn::Sub: "${AppName}-TaskExecutionRoleArn"}
+                  - !ImportValue {Fn::Sub: "${AppName}-OrdersTaskRoleArn"}
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AppName}-orders-pipeline"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeCommit, Version: "1"}
+              Configuration:
+                RepositoryName: !GetAtt SourceRepo.Name
+                BranchName: main
+              OutputArtifacts: [{Name: SourceOutput}]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref CodeBuildProject}
+              InputArtifacts: [{Name: SourceOutput}]
+              OutputArtifacts: [{Name: BuildOutput}]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: {Category: Deploy, Owner: AWS, Provider: ECS, Version: "1"}
+              Configuration:
+                ClusterName: !ImportValue {Fn::Sub: "${AppName}-ClusterName"}
+                ServiceName: !ImportValue {Fn::Sub: "${AppName}-OrdersServiceName"}
+                FileName: imagedefinitions.json
+                # Covers container start + test listener + BakeTimeInMinutes (5).
+                DeploymentTimeout: "30"
+              InputArtifacts: [{Name: BuildOutput}]
+
+Outputs:
+  CodeCommitCloneUrlHttp:
+    Value: !GetAtt SourceRepo.CloneUrlHttp
+  PipelineName:
+    Value: !Ref Pipeline
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket

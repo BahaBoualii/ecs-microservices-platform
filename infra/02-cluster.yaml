@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Shared platform layer: ECS cluster, Cloud Map namespace,
+  Application Load Balancer, ElastiCache Redis, and the shared JWT secret.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: saa-microservices
+  NamespaceName:
+    Type: String
+    Default: internal.saa-microservices.local
+
+Resources:
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref NamespaceName
+      Vpc: !ImportValue
+        Fn::Sub: "${AppName}-VpcId"
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppName}-alb"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: "${AppName}-AlbSgId"
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${AppName}-PublicSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${AppName}-PublicSubnet2Id"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: application/json
+            MessageBody: '{"error":"Not found"}'
+
+  # Test listener: during an ECS blue/green deployment of Orders, its listener rule
+  # (see 03-services.yaml) routes to the green revision before it takes live traffic.
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: application/json
+            MessageBody: '{"error":"Not found"}'
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private subnets for the shared Redis cache
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: "${AppName}-PrivateSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${AppName}-PrivateSubnet2Id"
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub "${AppName}-redis"
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      VpcSecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${AppName}-RedisSgId"
+
+  JwtSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/jwt-signing-key"
+      Description: HMAC secret the Auth service uses to sign and verify JWTs (other services call Auth /verify)
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+    Export: {Name: !Sub "${AppName}-ClusterArn"}
+  ClusterName:
+    Value: !Ref EcsCluster
+    Export: {Name: !Sub "${AppName}-ClusterName"}
+  NamespaceId:
+    Value: !Ref CloudMapNamespace
+    Export: {Name: !Sub "${AppName}-NamespaceId"}
+  NamespaceName:
+    Value: !Ref NamespaceName
+    Export: {Name: !Sub "${AppName}-NamespaceName"}
+  AlbArn:
+    Value: !Ref ApplicationLoadBalancer
+    Export: {Name: !Sub "${AppName}-AlbArn"}
+  AlbDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export: {Name: !Sub "${AppName}-AlbDnsName"}
+  HttpListenerArn:
+    Value: !Ref HttpListener
+    Export: {Name: !Sub "${AppName}-HttpListenerArn"}
+  TestListenerArn:
+    Value: !Ref TestListener
+    Export: {Name: !Sub "${AppName}-TestListenerArn"}
+  RedisEndpointAddress:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export: {Name: !Sub "${AppName}-RedisEndpointAddress"}
+  JwtSecretArn:
+    Value: !Ref JwtSigningSecret
+    Export: {Name: !Sub "${AppName}-JwtSecretArn"}

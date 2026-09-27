@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Image registry layer: one private ECR repository per service.
+  Kept in its own stack so images can be pushed before the ECS services
+  (03-services.yaml) are created - no placeholder-image bootstrap needed.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: saa-microservices
+
+Resources:
+  AuthRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}/auth"
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+  OrdersRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}/orders"
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+  NotificationsRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}/notifications"
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+Outputs:
+  AuthRepoUri:
+    Value: !GetAtt AuthRepo.RepositoryUri
+  OrdersRepoUri:
+    Value: !GetAtt OrdersRepo.RepositoryUri
+  OrdersRepoArn:
+    Value: !GetAtt OrdersRepo.Arn
+    Export: {Name: !Sub "${AppName}-OrdersRepoArn"}
+  NotificationsRepoUri:
+    Value: !GetAtt NotificationsRepo.RepositoryUri

@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Networking layer: VPC, public/private subnets across 2 AZs,
+  NAT Gateway, and security groups for the ALB, ECS tasks, and ElastiCache.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: saa-microservices
+  TestListenerCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >
+      CIDR allowed to reach the blue/green test listener (port 8080), which serves the
+      not-yet-live green revision. Defaults to VPC-only; pass your own IP as x.x.x.x/32
+      to test green deployments from your machine.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AppName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub "${AppName}-igw"}]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AppName}-public-1"}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AppName}-public-2"}]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub "${AppName}-private-1"}]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub "${AppName}-private-2"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${AppName}-public-rt"}]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{Key: Name, Value: !Sub "${AppName}-nat"}]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${AppName}-private-rt"}]
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow inbound HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref TestListenerCidr
+          Description: Blue/green test listener (green revision, pre-production)
+      Tags: [{Key: Name, Value: !Sub "${AppName}-alb-sg"}]
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - allow inbound from ALB and from other ECS tasks (service-to-service)
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${AppName}-ecs-sg"}]
+
+  EcsIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  EcsIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Redis - allow inbound from ECS tasks only
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: !Sub "${AppName}-redis-sg"}]
+
+  RedisIngressFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export: {Name: !Sub "${AppName}-VpcId"}
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export: {Name: !Sub "${AppName}-PublicSubnet1Id"}
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export: {Name: !Sub "${AppName}-PublicSubnet2Id"}
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export: {Name: !Sub "${AppName}-PrivateSubnet1Id"}
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export: {Name: !Sub "${AppName}-PrivateSubnet2Id"}
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: {Name: !Sub "${AppName}-AlbSgId"}
+  EcsSecurityGroupId:
+    Value: !Ref EcsSecurityGroup
+    Export: {Name: !Sub "${AppName}-EcsSgId"}
+  RedisSecurityGroupId:
+    Value: !Ref RedisSecurityGroup
+    Export: {Name: !Sub "${AppName}-RedisSgId"}
